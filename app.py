@@ -1,148 +1,368 @@
 import os
 import re
-from io import BytesIO
+import json
+import math
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
 import streamlit as st
+from dotenv import load_dotenv
 from openai import OpenAI
-from pydub import AudioSegment
 
-st.set_page_config(page_title="Aplikacja Generowanie Napisów V5", page_icon="🎬", layout="wide")
-st.title("🎬 Aplikacja Generowanie Napisów — V5")
-st.write("Wgraj film, wyodrębnij audio, wygeneruj napisy, edytuj je i pobierz plik SRT.")
+# ---------------------------------------------------------------------------
+# Konfiguracja
+# ---------------------------------------------------------------------------
 
-def secret(name, default=None):
-    try:
-        value = st.secrets.get(name)
-        if value:
-            return str(value)
-    except Exception:
-        pass
-    return os.getenv(name, default)
+load_dotenv()
 
-def extract_audio(data, ext):
-    audio = AudioSegment.from_file(BytesIO(data), format=ext)
-    out = BytesIO()
-    audio.export(out, format="mp3", bitrate="64k")
-    return out.getvalue()
+st.set_page_config(
+    page_title="Generator napisów V5",
+    page_icon="🎬",
+    layout="wide",
+)
 
-def split_audio(data, minutes=15):
-    audio = AudioSegment.from_file(BytesIO(data), format="mp3")
-    chunk_ms = minutes * 60 * 1000
-    chunks = []
-    for start in range(0, len(audio), chunk_ms):
-        out = BytesIO()
-        audio[start:start + chunk_ms].export(out, format="mp3", bitrate="64k")
-        chunks.append((out.getvalue(), start / 1000))
-    return chunks
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", "")
+OPENAI_TRANSCRIPTION_MODEL = (
+    os.getenv("OPENAI_TRANSCRIPTION_MODEL")
+    or st.secrets.get("OPENAI_TRANSCRIPTION_MODEL", "whisper-1")
+)
 
-def timestamp(seconds):
-    ms = max(0, int(round(float(seconds) * 1000)))
-    h, rem = divmod(ms, 3600000)
-    m, rem = divmod(rem, 60000)
-    s, milli = divmod(rem, 1000)
-    return f"{h:02d}:{m:02d}:{s:02d},{milli:03d}"
+if not OPENAI_API_KEY:
+    st.error("Brak klucza OPENAI_API_KEY. Dodaj go w Secrets lub w pliku .env.")
+    st.stop()
 
-def make_srt(segments):
-    blocks = []
-    for i, seg in enumerate(segments, 1):
-        text = seg["text"].strip()
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+WORK_DIR = Path(tempfile.gettempdir()) / "subtitle_v5"
+WORK_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# FFmpeg / ffprobe – bez pydub
+# ---------------------------------------------------------------------------
+
+def _require_binary(name: str) -> str:
+    path = shutil.which(name)
+    if not path:
+        st.error(
+            f"Nie znaleziono `{name}` w systemie. "
+            f"Dodaj `ffmpeg` do packages.txt (Streamlit Cloud) "
+            f"lub zainstaluj lokalnie."
+        )
+        st.stop()
+    return path
+
+
+def get_duration(path: str) -> float:
+    """Zwraca długość pliku multimedialnego w sekundach."""
+    ffprobe = _require_binary("ffprobe")
+    result = subprocess.run(
+        [
+            ffprobe, "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            path,
+        ],
+        capture_output=True, text=True, check=True,
+    )
+    return float(result.stdout.strip())
+
+
+def extract_audio(video_path: str, audio_path: str,
+                  sample_rate: int = 16000, channels: int = 1) -> None:
+    """Wyciąga audio z wideo do pliku WAV (mono, 16 kHz)."""
+    ffmpeg = _require_binary("ffmpeg")
+    subprocess.run(
+        [
+            ffmpeg, "-y",
+            "-i", video_path,
+            "-vn",
+            "-acodec", "pcm_s16le",
+            "-ar", str(sample_rate),
+            "-ac", str(channels),
+            audio_path,
+        ],
+        capture_output=True, text=True, check=True,
+    )
+
+
+def split_audio(audio_path: str, out_dir: str, segment_seconds: int = 600):
+    """Dzieli audio na segmenty. Zwraca listę ścieżek."""
+    ffmpeg = _require_binary("ffmpeg")
+    pattern = os.path.join(out_dir, "chunk_%03d.wav")
+    subprocess.run(
+        [
+            ffmpeg, "-y",
+            "-i", audio_path,
+            "-f", "segment",
+            "-segment_time", str(segment_seconds),
+            "-c", "copy",
+            pattern,
+        ],
+        capture_output=True, text=True, check=True,
+    )
+    chunks = sorted(Path(out_dir).glob("chunk_*.wav"))
+    return [str(p) for p in chunks]
+
+
+def has_audio_stream(path: str) -> bool:
+    ffprobe = _require_binary("ffprobe")
+    result = subprocess.run(
+        [
+            ffprobe, "-v", "error",
+            "-select_streams", "a",
+            "-show_entries", "stream=index",
+            "-of", "csv=p=0",
+            path,
+        ],
+        capture_output=True, text=True,
+    )
+    return bool(result.stdout.strip())
+
+
+# ---------------------------------------------------------------------------
+# Transkrypcja (OpenAI)
+# ---------------------------------------------------------------------------
+
+def transcribe_chunk(chunk_path: str, offset_seconds: float = 0.0):
+    """
+    Transkrybuje pojedynczy plik audio.
+    Zwraca listę segmentów: [{"start": float, "end": float, "text": str}, ...]
+    """
+    with open(chunk_path, "rb") as f:
+        response = client.audio.transcriptions.create(
+            model=OPENAI_TRANSCRIPTION_MODEL,
+            file=f,
+            response_format="verbose_json",
+            timestamp_granularities=["segment"],
+        )
+
+    segments = []
+    raw_segments = getattr(response, "segments", None) or []
+    for seg in raw_segments:
+        start = float(getattr(seg, "start", 0.0)) + offset_seconds
+        end = float(getattr(seg, "end", 0.0)) + offset_seconds
+        text = (getattr(seg, "text", "") or "").strip()
         if text:
-            start, end = sorted((float(seg["start"]), float(seg["end"])))
-            blocks.append(f"{i}\\n{timestamp(start)} --> {timestamp(end)}\\n{text}\\n")
-    return "\\n".join(blocks)
+            segments.append({"start": start, "end": end, "text": text})
 
-def valid_srt(text):
-    pattern = re.compile(r"^\\d{2}:\\d{2}:\\d{2},\\d{3}\\s*-->\\s*\\d{2}:\\d{2}:\\d{2},\\d{3}$")
-    count = 0
-    for block in re.split(r"\\n\\s*\\n", text.strip()):
-        lines = block.strip().splitlines()
-        if len(lines) >= 3 and lines[0].strip().isdigit() and pattern.match(lines[1].strip()):
-            count += 1
-    return count
+    # Fallback – brak segmentów, ale jest pełny tekst
+    if not segments:
+        full_text = (getattr(response, "text", "") or "").strip()
+        if full_text:
+            segments.append({
+                "start": offset_seconds,
+                "end": offset_seconds + 5.0,
+                "text": full_text,
+            })
+    return segments
 
-video = st.file_uploader("Wybierz plik wideo", type=["mp4", "mov", "m4v", "webm", "avi"])
-if not video:
-    st.info("Wgraj film, aby rozpocząć.")
-    st.stop()
 
-video_bytes = video.getvalue()
-ext = Path(video.name).suffix.lower().lstrip(".")
-if ext == "m4v":
-    ext = "mp4"
-mime = video.type or "video/mp4"
+def transcribe_audio_in_chunks(chunks, progress_cb=None):
+    all_segments = []
+    current_offset = 0.0
+    total = len(chunks)
 
-st.subheader("1. Film")
-st.video(video_bytes, format=mime)
-
-st.subheader("2. Wyodrębnij audio")
-if st.button("🎧 Wyodrębnij audio"):
-    try:
-        with st.spinner("Wyodrębniam audio..."):
-            st.session_state["v5_audio"] = extract_audio(video_bytes, ext)
-            st.session_state["v5_video_name"] = video.name
-        st.success("Audio gotowe.")
-    except Exception as e:
-        st.error(f"Nie udało się wyodrębnić audio: {e}")
-
-audio = st.session_state.get("v5_audio")
-if not audio or st.session_state.get("v5_video_name") != video.name:
-    st.stop()
-
-st.audio(audio, format="audio/mp3")
-st.caption(f"Rozmiar audio: {len(audio) / 1024 / 1024:.1f} MB")
-
-st.subheader("3. Generowanie napisów")
-api_key = secret("OPENAI_API_KEY")
-model = secret("OPENAI_TRANSCRIPTION_MODEL", "whisper-1")
-if not api_key:
-    st.error("Brak OPENAI_API_KEY. Dodaj go w Streamlit Cloud → Manage app → Settings → Secrets.")
-    st.stop()
-
-st.caption(f"Model: {model}")
-if st.button("🚀 Generuj napisy", type="primary"):
-    try:
-        client = OpenAI(api_key=api_key)
-        chunks = split_audio(audio)
-        segments = []
-        progress = st.progress(0)
-        for i, (chunk, offset) in enumerate(chunks, 1):
-            progress.progress((i - 1) / len(chunks), text=f"Transkrypcja części {i}/{len(chunks)}...")
-            file = BytesIO(chunk)
-            file.name = f"audio_{i}.mp3"
-            result = client.audio.transcriptions.create(
-                model=model,
-                file=file,
-                response_format="verbose_json",
-                timestamp_granularities=["segment"],
-            )
-            for seg in (getattr(result, "segments", None) or []):
-                text = str(getattr(seg, "text", "")).strip()
-                if text:
-                    start = float(getattr(seg, "start", 0)) + offset
-                    end = float(getattr(seg, "end", start - offset)) + offset
-                    segments.append({"start": start, "end": end, "text": text})
-        progress.progress(1.0, text="Gotowe")
-        if not segments:
-            raise RuntimeError("API nie zwróciło segmentów z timestampami. Sprawdź obsługę verbose_json i timestamp_granularities przez wybrany model.")
-        st.session_state["v5_srt"] = make_srt(segments)
-        st.session_state["v5_srt_video_name"] = video.name
-        st.success(f"Utworzono {len(segments)} segmentów.")
-    except Exception as e:
-        st.error(f"Błąd transkrypcji: {e}")
-
-if st.session_state.get("v5_srt") and st.session_state.get("v5_srt_video_name") == video.name:
-    st.subheader("4. Edycja SRT")
-    edited = st.text_area("Treść pliku SRT", value=st.session_state["v5_srt"], height=450, key=f"srt_{video.name}")
-    st.session_state["v5_srt"] = edited
-    count = valid_srt(edited)
-    if count:
-        st.success(f"Rozpoznano {count} bloków SRT.")
-        st.download_button("⬇️ Pobierz plik SRT", data=edited.encode("utf-8"), file_name=Path(video.name).stem + ".srt", mime="application/x-subrip", on_click="ignore")
-        st.subheader("5. Podgląd filmu z napisami")
+    for i, chunk in enumerate(chunks, start=1):
+        if progress_cb:
+            progress_cb(i, total, chunk)
+        segs = transcribe_chunk(chunk, offset_seconds=current_offset)
+        all_segments.extend(segs)
         try:
-            st.video(video_bytes, format=mime, subtitles=edited)
+            current_offset += get_duration(chunk)
+        except Exception:
+            current_offset += 600.0  # bezpieczny fallback
+
+    return all_segments
+
+
+# ---------------------------------------------------------------------------
+# SRT
+# ---------------------------------------------------------------------------
+
+def format_timestamp(seconds: float) -> str:
+    if seconds < 0:
+        seconds = 0.0
+    ms = int(round(seconds * 1000))
+    h = ms // 3_600_000
+    ms %= 3_600_000
+    m = ms // 60_000
+    ms %= 60_000
+    s = ms // 1000
+    ms %= 1000
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def segments_to_srt(segments) -> str:
+    lines = []
+    for i, seg in enumerate(segments, start=1):
+        lines.append(str(i))
+        lines.append(
+            f"{format_timestamp(seg['start'])} --> {format_timestamp(seg['end'])}"
+        )
+        lines.append(seg["text"])
+        lines.append("")
+    return "\n".join(lines)
+
+
+def parse_srt(srt_text: str):
+    blocks = re.split(r"\n\s*\n", srt_text.strip())
+    segments = []
+    time_re = re.compile(
+        r"(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*"
+        r"(\d{2}):(\d{2}):(\d{2}),(\d{3})"
+    )
+
+    def to_sec(h, m, s, ms):
+        return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000.0
+
+    for block in blocks:
+        lines = block.splitlines()
+        if len(lines) < 2:
+            continue
+        time_line = None
+        text_start = 1
+        for idx, line in enumerate(lines):
+            if "-->" in line:
+                time_line = line
+                text_start = idx + 1
+                break
+        if not time_line:
+            continue
+        match = time_re.search(time_line)
+        if not match:
+            continue
+        g = match.groups()
+        start = to_sec(*g[:4])
+        end = to_sec(*g[4:])
+        text = "\n".join(lines[text_start:]).strip()
+        segments.append({"start": start, "end": end, "text": text})
+    return segments
+
+
+# ---------------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------------
+
+st.title("🎬 Generator napisów V5")
+st.caption("FFmpeg + OpenAI Whisper · wersja samodzielna, bez pydub")
+
+with st.sidebar:
+    st.header("Ustawienia")
+    st.write(f"**Model transkrypcji:** `{OPENAI_TRANSCRIPTION_MODEL}`")
+    segment_seconds = st.slider(
+        "Długość segmentu audio (s)", min_value=60, max_value=1200,
+        value=600, step=60,
+    )
+    st.markdown("---")
+    st.markdown(
+        "**Wskazówka:** dla długich filmów transkrypcja może trwać kilka minut."
+    )
+
+uploaded = st.file_uploader(
+    "Wgraj film lub audio",
+    type=["mp4", "mov", "mkv", "avi", "webm", "mp3", "wav", "m4a", "flac"],
+)
+
+if uploaded is not None:
+    session_dir = WORK_DIR / "session"
+    if session_dir.exists():
+        shutil.rmtree(session_dir, ignore_errors=True)
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    input_path = session_dir / uploaded.name
+    with open(input_path, "wb") as f:
+        f.write(uploaded.getbuffer())
+
+    st.success(f"Wgrano: {uploaded.name}")
+
+    is_video = uploaded.type and uploaded.type.startswith("video")
+    if is_video:
+        st.video(str(input_path))
+
+    if st.button("▶️ Generuj napisy", type="primary"):
+        try:
+            with st.spinner("Analiza pliku..."):
+                if not has_audio_stream(str(input_path)):
+                    st.error("Plik nie zawiera ścieżki audio.")
+                    st.stop()
+
+            audio_path = session_dir / "audio.wav"
+
+            with st.spinner("Wyodrębnianie audio (FFmpeg)..."):
+                extract_audio(str(input_path), str(audio_path))
+
+            with st.spinner("Dzielenie audio na segmenty..."):
+                chunks_dir = session_dir / "chunks"
+                chunks_dir.mkdir(exist_ok=True)
+                chunks = split_audio(
+                    str(audio_path), str(chunks_dir), segment_seconds
+                )
+
+            st.info(f"Liczba segmentów: {len(chunks)}")
+
+            progress = st.progress(0.0, text="Transkrypcja...")
+
+            def cb(i, total, chunk):
+                progress.progress(
+                    i / total, text=f"Transkrypcja {i}/{total}: {Path(chunk).name}"
+                )
+
+            with st.spinner("Transkrypcja (OpenAI Whisper)..."):
+                segments = transcribe_audio_in_chunks(chunks, progress_cb=cb)
+
+            progress.empty()
+
+            if not segments:
+                st.error("Nie udało się uzyskać transkrypcji.")
+                st.stop()
+
+            srt_text = segments_to_srt(segments)
+            st.session_state["srt_text"] = srt_text
+            st.session_state["segments"] = segments
+            st.success(f"Gotowe! Segmentów: {len(segments)}")
+
+        except subprocess.CalledProcessError as e:
+            st.error("Błąd FFmpeg.")
+            st.code((e.stderr or "")[-2000:])
         except Exception as e:
-            st.warning(f"Podgląd napisów jest niedostępny, ale możesz pobrać SRT. Szczegóły: {e}")
+            st.exception(e)
+
+# --- Edycja i podgląd napisów ------------------------------------------------
+
+if "srt_text" in st.session_state:
+    st.markdown("---")
+    st.subheader("✏️ Edycja napisów (SRT)")
+    edited_srt = st.text_area(
+        "Możesz poprawić napisy ręcznie:",
+        value=st.session_state["srt_text"],
+        height=400,
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.download_button(
+            "⬇️ Pobierz .srt",
+            data=edited_srt.encode("utf-8"),
+            file_name="napisy.srt",
+            mime="text/plain",
+        )
+    with col2:
+        st.download_button(
+            "⬇️ Pobierz .txt",
+            data="\n".join(
+                s["text"] for s in parse_srt(edited_srt)
+            ).encode("utf-8"),
+            file_name="napisy.txt",
+            mime="text/plain",
+        )
+
+    # Podgląd wideo z napisami (jeśli wgrany plik był wideo)
+    st.markdown("---")
+    st.subheader("👀 Podgląd")
+    if uploaded is not None and uploaded.type and uploaded.type.startswith("video"):
+        st.video(str(input_path), subtitles=edited_srt.encode("utf-8"))
     else:
-        st.warning("Nie rozpoznano bloków SRT. Zachowaj numer, wiersz czasu i pusty wiersz między blokami.")
+        st.caption("Podgląd wideo dostępny tylko dla plików wideo.")
